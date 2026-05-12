@@ -45,6 +45,9 @@ jobs:
           if [ -f "dbt_project.yml" ]; then
             REPO_TYPE="dbt"
             DEFAULT_PATHS="models/ macros/ tests/ snapshots/"
+          elif [ -f "sfdx-project.json" ]; then
+            REPO_TYPE="salesforce"
+            DEFAULT_PATHS="."
           elif ls *.ldt 1>/dev/null 2>&1 || ls *.pks 1>/dev/null 2>&1 || ls *.pkb 1>/dev/null 2>&1; then
             REPO_TYPE="ebs"
             DEFAULT_PATHS="."
