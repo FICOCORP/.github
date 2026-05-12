@@ -1,0 +1,305 @@
+name: "AI Code Review (Cortex) — Reusable"
+
+on:
+  workflow_call:
+    inputs:
+      file-patterns:
+        description: "Space-separated path prefixes to scan for changes (e.g., 'models/ macros/')"
+        required: false
+        type: string
+        default: ""
+      file-extensions:
+        description: "Regex for file extensions to review (e.g., '\\.(sql|yml|yaml)$')"
+        required: false
+        type: string
+        default: "\\.(sql|yml|yaml|pks|pkb|pls|py|txt)$"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: "Cortex Code Review"
+    runs-on: ubuntu-latest
+    env:
+      SNOWFLAKE_ACCOUNT: FICO-PRODUCTION
+      SNOWFLAKE_USER: SVC_GITHUB_CODE_REVIEW
+      SNOWFLAKE_ROLE: CORTEX_CODE_REVIEWER
+      SNOWFLAKE_WAREHOUSE: COMPUTE_WH
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch base branch for diff
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Detect repo type and get changed files
+        id: detect
+        run: |
+          # Auto-detect repo type based on files present
+          if [ -f "dbt_project.yml" ]; then
+            REPO_TYPE="dbt"
+            DEFAULT_PATHS="models/ macros/ tests/ snapshots/"
+          elif ls *.ldt 1>/dev/null 2>&1 || ls *.pks 1>/dev/null 2>&1 || ls *.pkb 1>/dev/null 2>&1; then
+            REPO_TYPE="ebs"
+            DEFAULT_PATHS="."
+          elif [ -f "connector.py" ] && [ -d ".fivetran" ]; then
+            REPO_TYPE="fivetran-sdk"
+            DEFAULT_PATHS="."
+          else
+            REPO_TYPE="generic"
+            DEFAULT_PATHS="."
+          fi
+
+          echo "repo_type=$REPO_TYPE" >> $GITHUB_OUTPUT
+          echo "Detected repo type: $REPO_TYPE"
+
+          # Use caller-provided paths or fall back to auto-detected defaults
+          PATHS="${{ inputs.file-patterns }}"
+          if [ -z "$PATHS" ]; then
+            PATHS="$DEFAULT_PATHS"
+          fi
+
+          # Get changed files matching the paths and extensions
+          EXTENSION_REGEX="${{ inputs.file-extensions }}"
+          if [ "$PATHS" = "." ]; then
+            FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}..HEAD | grep -E "$EXTENSION_REGEX" || true)
+          else
+            FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}..HEAD -- $PATHS | grep -E "$EXTENSION_REGEX" || true)
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "No reviewable files changed"
+            echo "has_files=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_files=true" >> $GITHUB_OUTPUT
+            echo "$FILES" > /tmp/changed_files.txt
+            echo "Changed files:"
+            cat /tmp/changed_files.txt
+          fi
+
+      - name: Install Python and Snowflake connector
+        if: steps.detect.outputs.has_files == 'true'
+        run: |
+          pip install snowflake-connector-python cryptography
+
+      - name: Write review prompt to file
+        if: steps.detect.outputs.has_files == 'true'
+        shell: bash
+        run: |
+          python3 -c "import json,os; print(json.loads(os.environ['PROMPT_JSON']))" > /tmp/review_prompt.txt
+        env:
+          PROMPT_JSON: ${{ toJSON(vars.CORTEX_CODE_REVIEW_PROMPT) }}
+
+      - name: Fetch review profile from .github repo
+        if: steps.detect.outputs.has_files == 'true'
+        run: |
+          REPO_TYPE="${{ steps.detect.outputs.repo_type }}"
+          PROFILE_URL="https://raw.githubusercontent.com/FICOCORP/.github/main/review-profiles/${REPO_TYPE}.md"
+          curl -sf "$PROFILE_URL" > /tmp/review_profile.md 2>/dev/null || echo "" > /tmp/review_profile.md
+          if [ -s /tmp/review_profile.md ]; then
+            echo "Loaded review profile: $REPO_TYPE"
+          else
+            echo "No review profile found for: $REPO_TYPE (using prompt variable only)"
+          fi
+
+      - name: Run Cortex code review
+        if: steps.detect.outputs.has_files == 'true'
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_CODE_REVIEW_PRIVATE_KEY }}
+          REPO_TYPE: ${{ steps.detect.outputs.repo_type }}
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import json
+          from datetime import date
+          import snowflake.connector
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.backends import default_backend
+
+          # Load private key
+          private_key_pem = os.environ["SNOWFLAKE_PRIVATE_KEY"].encode()
+          private_key = serialization.load_pem_private_key(
+              private_key_pem, password=None, backend=default_backend()
+          )
+          private_key_bytes = private_key.private_bytes(
+              encoding=serialization.Encoding.DER,
+              format=serialization.PrivateFormat.PKCS8,
+              encryption_algorithm=serialization.NoEncryption(),
+          )
+
+          # Connect to Snowflake
+          conn = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              role=os.environ["SNOWFLAKE_ROLE"],
+              warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+              private_key=private_key_bytes,
+          )
+
+          # Read changed files
+          with open("/tmp/changed_files.txt") as f:
+              files = [line.strip() for line in f if line.strip()]
+
+          # Collect file contents (limit to avoid token overflow)
+          file_contents = []
+          total_chars = 0
+          MAX_CHARS = 80000
+
+          for filepath in files:
+              if not os.path.exists(filepath):
+                  continue
+              with open(filepath) as f:
+                  content = f.read()
+              if total_chars + len(content) > MAX_CHARS:
+                  file_contents.append(f"--- {filepath} (SKIPPED - too large for single review) ---")
+                  continue
+              file_contents.append(f"--- {filepath} ---\n{content}")
+              total_chars += len(content)
+
+          if not file_contents:
+              print("No reviewable file contents found")
+              with open("/tmp/review_output.md", "w") as f:
+                  f.write("")
+              exit(0)
+
+          all_code = "\n\n".join(file_contents)
+
+          # Build prompt from GitHub variable (org or repo level)
+          today = date.today().isoformat()
+          review_instructions = ""
+          try:
+              with open("/tmp/review_prompt.txt") as f:
+                  review_instructions = f.read().strip()
+          except FileNotFoundError:
+              pass
+
+          if not review_instructions:
+              review_instructions = (
+                  "You are a senior engineer reviewing a pull request. "
+                  "Review the changed files for correctness, best practices, "
+                  "performance, security, and style. "
+                  "Be concise. Only flag real issues. Format as markdown."
+              )
+
+          # Load review profile from central .github repo (fetched in prior step)
+          profile_context = ""
+          try:
+              with open("/tmp/review_profile.md") as f:
+                  content = f.read().strip()
+              if content:
+                  profile_context = f"\n\n## Review Profile ({os.environ.get('REPO_TYPE', 'unknown')})\n{content}\n\n"
+          except FileNotFoundError:
+              pass
+
+          # Read .sqlfluff config if present (linting context)
+          sqlfluff_context = ""
+          try:
+              with open(".sqlfluff") as f:
+                  sqlfluff_context = (
+                      "## SQLFluff Configuration (source of truth for linting rules)\n"
+                      "Apply these rules when reviewing for style violations:\n"
+                      "```ini\n" + f.read().strip() + "\n```\n\n"
+                  )
+          except FileNotFoundError:
+              pass
+
+          # Read additional review context/skills from .github/review-context/
+          import glob as glob_mod
+          skills_context = ""
+          skill_files = sorted(
+              glob_mod.glob(".github/review-context/*.md")
+              + glob_mod.glob(".github/review-context/*.txt")
+          )
+          for skill_file in skill_files:
+              if skill_file.endswith("README.md"):
+                  continue
+              try:
+                  with open(skill_file) as f:
+                      content = f.read().strip()
+                  if content:
+                      skills_context += f"\n\n{content}\n\n"
+              except Exception:
+                  pass
+
+          # Assemble final prompt
+          prompt = (
+              f"Today's date is {today}.\n\n"
+              f"{review_instructions}\n\n"
+              f"{profile_context}"
+              f"{sqlfluff_context}"
+              f"{skills_context}"
+              f"Changed files:\n{all_code}"
+          )
+
+          print(f"Prompt size: {len(prompt)} chars | Repo type: {os.environ.get('REPO_TYPE')}")
+
+          # Call Cortex
+          cursor = conn.cursor()
+          cursor.execute(
+              "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s) AS review",
+              ("claude-sonnet-4-5", prompt),
+          )
+          result = cursor.fetchone()[0]
+          cursor.close()
+          conn.close()
+
+          # Write output
+          with open("/tmp/review_output.md", "w") as f:
+              f.write(result)
+
+          print("Review complete")
+          print(result[:500])
+          PYTHON_SCRIPT
+
+      - name: Post review comment
+        if: steps.detect.outputs.has_files == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reviewPath = '/tmp/review_output.md';
+
+            if (!fs.existsSync(reviewPath)) {
+              console.log('No review output found');
+              return;
+            }
+
+            const review = fs.readFileSync(reviewPath, 'utf8').trim();
+            if (!review) {
+              console.log('Review was empty - no issues found');
+              return;
+            }
+
+            const body = `## 🔍 AI Code Review (Snowflake Cortex)\n\n${review}\n\n---\n*Advisory only — generated by Snowflake Cortex via \`SVC_GITHUB_CODE_REVIEW\`*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.body.includes('AI Code Review (Snowflake Cortex)')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
