@@ -12,7 +12,7 @@ on:
         description: "Regex for file extensions to review (e.g., '\\.(sql|yml|yaml)$')"
         required: false
         type: string
-        default: "\\.(sql|yml|yaml|pks|pkb|pls|py|txt)$"
+        default: "\\.(sql|yml|yaml|pks|pkb|pls|plb|py|cls|trigger|xml)$"
 
 permissions:
   contents: read
