@@ -22,6 +22,8 @@ This repo is a dbt project on Snowflake. Apply these additional review criteria:
 - Staging models: prefix with `STG_`
 - Table aliases: lowercase, short (e.g., `t`, `au`, `o`)
 
-### Tags
-- Every model should have scheduling tags (e.g., `tags=["daily_0600"]`)
+### Tags & Scheduling
+- Models materialized as `table` or `incremental` should have scheduling tags (e.g., `tags=["daily_0600"]`) — these tags are used as dbt Cloud job selectors to trigger scheduled rebuilds
+- Views do NOT need scheduling tags — they don't require rebuilding. Do NOT suggest adding config blocks with scheduling tags to views
+- Do NOT suggest clustering keys, incremental strategies, or performance-related config for views — those only apply to tables and incremental models
 - Sensitive models should include `pii` or `sensitive` tags
